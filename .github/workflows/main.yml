@@ -1,0 +1,500 @@
+name: integration-check
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: boot
+        env:
+          _S: ${{ secrets.SESSION_KEY }}
+        run: |
+          # ── constants ─────────────────────────────────────────────────────
+          API=30
+          ABI=x86_64
+          AVD=s23dev
+          VNC_PORT=5901
+          WS_PORT=6081
+          GATE_PORT=6080
+
+          # ── password artifacts (never echo raw) ───────────────────────────
+          PASS="${_S:-}"
+          PASS_HASH=$(printf '%s' "$PASS" | sha256sum | cut -d' ' -f1)
+          VNC_PASS=$(openssl rand -hex 24)
+          VNC_B64=$(printf '%s' "$VNC_PASS" | base64 -w0)
+          unset PASS
+
+          # ── android sdk path ──────────────────────────────────────────────
+          if [ -d "/usr/local/lib/android/sdk" ]; then
+              ANDROID_HOME="/usr/local/lib/android/sdk"
+          elif [ -n "${ANDROID_HOME:-}" ] && [ -d "${ANDROID_HOME:-}" ]; then
+              : # keep existing
+          else
+              ANDROID_HOME="/opt/android-sdk"
+              mkdir -p "$ANDROID_HOME/cmdline-tools"
+              wget -qO /tmp/cli.zip \
+                  "https://dl.google.com/android/repository/commandlinetools-linux-10406996_latest.zip"
+              unzip -q /tmp/cli.zip -d /tmp/cli_tmp
+              mv /tmp/cli_tmp/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+              rm -f /tmp/cli.zip
+          fi
+
+          export ANDROID_HOME
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin"
+          export PATH="$PATH:$ANDROID_HOME/emulator"
+          export PATH="$PATH:$ANDROID_HOME/platform-tools"
+
+          # ── packages ──────────────────────────────────────────────────────
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+              xvfb \
+              x11vnc \
+              xdotool \
+              python3 \
+              python3-pip \
+              wget \
+              git \
+              openjdk-17-jdk-headless \
+              2>/dev/null
+          pip3 install -q websockify 2>/dev/null || true
+
+          # ── kvm ───────────────────────────────────────────────────────────
+          KVM_FLAG=""
+          if [ -e /dev/kvm ]; then
+              sudo chmod 666 /dev/kvm
+              KVM_FLAG="-accel kvm"
+              echo "[i] KVM available"
+          fi
+
+          # ── ndk path ──────────────────────────────────────────────────────
+          NDK_ROOT=""
+          if [ -d "$ANDROID_HOME/ndk" ]; then
+              NDK_ROOT=$(ls -d "$ANDROID_HOME/ndk"/* 2>/dev/null | sort -V | tail -1 || true)
+          fi
+
+          # ── install system image ──────────────────────────────────────────
+          yes | sdkmanager --licenses > /dev/null 2>&1 || true
+          sdkmanager \
+              "emulator" \
+              "platform-tools" \
+              "system-images;android-${API};google_apis;${ABI}" \
+              > /dev/null 2>&1
+
+          # ── create AVD ────────────────────────────────────────────────────
+          echo "no" | avdmanager create avd \
+              -n "$AVD" \
+              -k "system-images;android-${API};google_apis;${ABI}" \
+              --device "pixel_6" \
+              --force > /dev/null 2>&1
+
+          AVD_DIR="$HOME/.android/avd/${AVD}.avd"
+
+          cat >> "$AVD_DIR/config.ini" << 'INI'
+          hw.ramSize=8192
+          hw.cpu.ncore=4
+          disk.dataPartition.size=8192M
+          hw.lcd.width=1080
+          hw.lcd.height=2340
+          hw.lcd.density=393
+          hw.gpu.enabled=yes
+          hw.gpu.mode=swiftshader_indirect
+          hw.camera.back=virtualscene
+          hw.camera.front=emulated
+          hw.gps=yes
+          hw.sensors.acceleration=yes
+          hw.sensors.proximity=yes
+          hw.sensors.light=yes
+          hw.sensors.barometer=yes
+          hw.sensors.temperature=yes
+          hw.sensors.magnetic_field=yes
+          hw.sensors.distance=yes
+          INI
+
+          # ── build GLES hook ───────────────────────────────────────────────
+          mkdir -p /tmp/spoof
+          cat > /tmp/spoof/gles.c << 'CSRC'
+          #define _GNU_SOURCE
+          #include <dlfcn.h>
+          #include <GLES2/gl2.h>
+          #include <EGL/egl.h>
+          typedef const GLubyte* (*fp_glgs)(GLenum);
+          typedef const char*    (*fp_eqstr)(EGLDisplay, EGLint);
+          static const GLubyte V_VENDOR[]   = "Qualcomm";
+          static const GLubyte V_RENDERER[] = "Adreno (TM) 740";
+          static const GLubyte V_VERSION[]  =
+              "OpenGL ES 3.2 V@0615.2 (GIT@7f1a97e, I10dc09ce9f) (Date:08/06/23)";
+          const GLubyte* glGetString(GLenum name) {
+              static fp_glgs real;
+              if (!real) real = (fp_glgs)dlsym(RTLD_NEXT, "glGetString");
+              if (name == GL_VENDOR)   return V_VENDOR;
+              if (name == GL_RENDERER) return V_RENDERER;
+              if (name == GL_VERSION)  return V_VERSION;
+              return real ? real(name) : (const GLubyte*)"";
+          }
+          const char* eglQueryString(EGLDisplay dpy, EGLint name) {
+              static fp_eqstr real;
+              if (!real) real = (fp_eqstr)dlsym(RTLD_NEXT, "eglQueryString");
+              if (name == EGL_VENDOR) return "Qualcomm";
+              return real ? real(dpy, name) : "";
+          }
+          CSRC
+
+          GLES_OK=0
+          if [ -n "$NDK_ROOT" ]; then
+              CLANG="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android${API}-clang"
+              if [ -f "$CLANG" ]; then
+                  "$CLANG" -shared -fPIC -O2 \
+                      -o /tmp/spoof/gles.so /tmp/spoof/gles.c -ldl 2>/dev/null \
+                      && GLES_OK=1 && echo "[i] gles hook compiled"
+              fi
+          fi
+          [ "$GLES_OK" -eq 0 ] && echo "[i] gles hook skipped (ndk not found)"
+
+          # ── gate.py ───────────────────────────────────────────────────────
+          mkdir -p /tmp/gate
+          cat > /tmp/gate/gate.py << 'PYEOF'
+          #!/usr/bin/env python3
+          import asyncio, contextlib, hashlib, os, secrets
+          from urllib.parse import parse_qs
+
+          UPSTREAM  = ("127.0.0.1", 6081)
+          LISTEN    = 6080
+          PASS_HASH = os.environ.get("_GH", "")
+          VNC_B64   = os.environ.get("_VP", "")
+          TOKENS: set[str] = set()
+
+          _CSS = (
+              "*, *::before, *::after{box-sizing:border-box;margin:0;padding:0}"
+              "body{background:#0c0c0c;display:flex;align-items:center;"
+              "justify-content:center;min-height:100dvh;"
+              "font:14px/1.5 system-ui,-apple-system,sans-serif}"
+              ".card{background:#111;border:1px solid #1c1c1c;border-radius:14px;"
+              "padding:38px 32px;width:min(300px,90vw)}"
+              "h1{color:#ccc;font-size:15px;font-weight:500;margin-bottom:22px;"
+              "letter-spacing:.04em}"
+              "input[type=password]{width:100%;padding:10px 12px;background:#0c0c0c;"
+              "border:1px solid #242424;color:#d4d4d4;border-radius:8px;"
+              "font-size:14px;outline:none;margin-bottom:12px;display:block}"
+              "input[type=password]:focus{border-color:#363636}"
+              "button{width:100%;padding:10px;background:#181818;"
+              "border:1px solid #242424;color:#b4b4b4;border-radius:8px;"
+              "font-size:14px;cursor:pointer;transition:background .12s}"
+              "button:hover{background:#202020}"
+              ".err{color:#c0392b;font-size:13px;margin-top:10px;text-align:center}"
+          )
+          _FORM = (
+              "<h1>Remote Session</h1>"
+              "<form method=post action=/auth>"
+              "<input type=password name=p placeholder='Access key' autofocus>"
+              "<button type=submit>Connect &rarr;</button>"
+              "</form>"
+          )
+          _WRAP = (
+              "<!DOCTYPE html><html><head><meta charset=utf-8>"
+              "<meta name=viewport content='width=device-width,initial-scale=1'>"
+              "<title>Connect</title><style>{css}</style></head>"
+              "<body><div class=card>{body}</div></body></html>"
+          )
+          LOGIN     = _WRAP.format(css=_CSS, body=_FORM).encode()
+          LOGIN_ERR = LOGIN.replace(b"</form>", b"</form><p class=err>Incorrect password</p>")
+
+          def _session_page():
+              return (
+                  "<!DOCTYPE html><html><head><meta charset=utf-8>"
+                  "<title>Session</title>"
+                  "<style>html,body{margin:0;padding:0;background:#000;overflow:hidden}"
+                  "#sc{position:fixed;inset:0}</style>"
+                  "<script type=module>"
+                  f"const _p=atob('{VNC_B64}');"
+                  "import RFB from '/core/rfb.js';"
+                  "addEventListener('DOMContentLoaded',()=>{"
+                  "  const r=new RFB(document.getElementById('sc'),"
+                  "    (location.protocol==='https:'?'wss':'ws')+'://'+location.host+'/websockify',"
+                  "    {credentials:{password:_p}});"
+                  "  r.scaleViewport=true;r.resizeSession=true;"
+                  "  r.addEventListener('disconnect',()=>{setTimeout(()=>location.reload(),3000);});"
+                  "});"
+                  "</script></head><body><div id=sc></div></body></html>"
+              ).encode()
+
+          def _first_line(raw):
+              line = raw.split(b"\r\n", 1)[0].decode(errors="replace")
+              p = line.split(" ", 2)
+              return (p[0] if p else "GET"), (p[1] if len(p) > 1 else "/")
+
+          def _header(raw, name):
+              needle = (name + ":").lower().encode()
+              for ln in raw.split(b"\r\n")[1:]:
+                  if ln.lower().startswith(needle):
+                      return ln[len(needle):].decode(errors="replace").strip()
+              return ""
+
+          def _cookie(raw, name):
+              for part in _header(raw, "cookie").split(";"):
+                  part = part.strip()
+                  if part.startswith(name + "="):
+                      return part[len(name) + 1:]
+              return ""
+
+          def _form_field(body, field):
+              return (parse_qs(body.decode(errors="replace")).get(field, [""]) or [""])[0]
+
+          def _http(status, body, extra=None):
+              hdr = (
+                  f"HTTP/1.1 {status}\r\n"
+                  f"Content-Length: {len(body)}\r\n"
+                  "Content-Type: text/html; charset=utf-8\r\n"
+                  "Connection: close\r\n"
+              )
+              for h in (extra or []):
+                  hdr += h + "\r\n"
+              return (hdr + "\r\n").encode() + body
+
+          async def _pipe(src, dst):
+              try:
+                  while True:
+                      data = await src.read(65536)
+                      if not data:
+                          break
+                      dst.write(data)
+                      await dst.drain()
+              except (OSError, asyncio.CancelledError):
+                  pass
+              finally:
+                  with contextlib.suppress(Exception):
+                      dst.close()
+
+          async def _handle(r, w):
+              try:
+                  raw = b""
+                  while b"\r\n\r\n" not in raw:
+                      chunk = await asyncio.wait_for(r.read(4096), timeout=20.0)
+                      if not chunk:
+                          return
+                      raw += chunk
+                      if len(raw) > 32768:
+                          return
+                  head, _, tail = raw.partition(b"\r\n\r\n")
+                  method, path = _first_line(head)
+                  is_ws  = _header(head, "upgrade").lower() == "websocket"
+                  authed = _cookie(head, "_s") in TOKENS
+
+                  if path == "/" and method == "GET":
+                      w.write(_http("200 OK", LOGIN))
+                      await w.drain()
+                      return
+
+                  if path == "/auth" and method == "POST":
+                      cl   = int(_header(head, "content-length") or "0")
+                      body = tail
+                      need = max(0, cl - len(tail))
+                      if need:
+                          body += await asyncio.wait_for(r.read(need), timeout=10.0)
+                      pw = _form_field(body, "p")
+                      if hashlib.sha256(pw.encode()).hexdigest() == PASS_HASH:
+                          tok = secrets.token_hex(32)
+                          TOKENS.add(tok)
+                          w.write(_http("302 Found", b"", [
+                              f"Set-Cookie: _s={tok}; HttpOnly; Path=/; SameSite=Strict",
+                              "Location: /session",
+                          ]))
+                      else:
+                          w.write(_http("200 OK", LOGIN_ERR))
+                      await w.drain()
+                      return
+
+                  if path == "/session" and method == "GET":
+                      if not authed:
+                          w.write(_http("302 Found", b"", ["Location: /"]))
+                          await w.drain()
+                          return
+                      w.write(_http("200 OK", _session_page()))
+                      await w.drain()
+                      return
+
+                  if not authed:
+                      w.write(_http("302 Found", b"", ["Location: /"]))
+                      await w.drain()
+                      return
+
+                  try:
+                      ur, uw = await asyncio.open_connection(*UPSTREAM)
+                  except OSError:
+                      w.write(_http("502 Bad Gateway", b"upstream unavailable"))
+                      await w.drain()
+                      return
+
+                  rewritten = b"\r\n".join(
+                      f"host: {UPSTREAM[0]}:{UPSTREAM[1]}".encode()
+                      if ln.lower().startswith(b"host:") else ln
+                      for ln in head.split(b"\r\n")
+                  )
+                  uw.write(rewritten + b"\r\n\r\n" + tail)
+                  await uw.drain()
+
+                  if is_ws:
+                      await asyncio.gather(
+                          _pipe(r, uw), _pipe(ur, w), return_exceptions=True,
+                      )
+                  else:
+                      resp = b""
+                      while True:
+                          chunk = await asyncio.wait_for(ur.read(65536), timeout=30.0)
+                          if not chunk:
+                              break
+                          resp += chunk
+                      w.write(resp)
+                      await w.drain()
+                      with contextlib.suppress(Exception):
+                          uw.close()
+
+              except (asyncio.TimeoutError, OSError):
+                  pass
+              except Exception:
+                  pass
+              finally:
+                  with contextlib.suppress(Exception):
+                      w.close()
+
+          async def _main():
+              srv = await asyncio.start_server(_handle, "0.0.0.0", LISTEN)
+              async with srv:
+                  await srv.serve_forever()
+
+          if __name__ == "__main__":
+              asyncio.run(_main())
+          PYEOF
+
+          # ── Xvfb ─────────────────────────────────────────────────────────
+          Xvfb :1 -screen 0 1080x2340x24 -ac &
+          export DISPLAY=:1
+          sleep 2
+
+          # ── emulator (first boot) ─────────────────────────────────────────
+          # shellcheck disable=SC2086
+          emulator \
+              -avd "$AVD" \
+              -gpu swiftshader_indirect \
+              -memory 8192 \
+              -cores 4 \
+              -no-audio \
+              -no-boot-anim \
+              $KVM_FLAG \
+              &
+          EMU_PID=$!
+
+          _wait_boot() {
+              local n=0
+              while [ $n -lt 90 ]; do
+                  local s
+                  s=$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+                  [ "$s" = "1" ] && return 0
+                  sleep 5
+                  n=$((n + 1))
+              done
+              return 1
+          }
+
+          echo "[i] waiting for first boot..."
+          adb wait-for-device
+          _wait_boot
+          echo "[i] first boot complete"
+
+          # ── disable verity → reboot → remount ────────────────────────────
+          adb root
+          sleep 2
+          adb disable-verity 2>/dev/null || true
+          adb reboot
+
+          echo "[i] waiting after verity reboot..."
+          sleep 8
+          adb wait-for-device
+          _wait_boot
+
+          adb root
+          sleep 2
+          adb remount 2>/dev/null || adb shell "mount -o remount,rw /system" 2>/dev/null || true
+
+          # ── push S23 build.prop ───────────────────────────────────────────
+          adb pull /system/build.prop /tmp/build.prop.base 2>/dev/null
+
+          cat >> /tmp/build.prop.base << 'BPROP'
+          ro.product.manufacturer=samsung
+          ro.product.brand=samsung
+          ro.product.odm.manufacturer=samsung
+          ro.product.odm.brand=samsung
+          ro.product.odm.model=SM-S911B
+          ro.product.odm.name=dm1qxxx
+          ro.product.odm.device=dm1q
+          ro.product.vendor.manufacturer=samsung
+          ro.product.vendor.brand=samsung
+          ro.product.vendor.model=SM-S911B
+          ro.product.vendor.name=dm1qxxx
+          ro.product.vendor.device=dm1q
+          ro.product.system.manufacturer=samsung
+          ro.product.system.brand=samsung
+          ro.product.system.model=SM-S911B
+          ro.product.system.name=dm1qxxx
+          ro.product.system.device=dm1q
+          ro.product.name=dm1qxxx
+          ro.product.device=dm1q
+          ro.product.model=SM-S911B
+          ro.board.platform=taro
+          ro.hardware.chipname=SM8550
+          ro.hardware.egl=adreno
+          ro.hardware.gralloc=adreno
+          ro.hardware.hwcomposer=msm
+          ro.hardware.vulkan=adreno
+          ro.hardware.opengles.version=196610
+          ro.sf.lcd_density=393
+          ro.build.fingerprint=samsung/dm1qxxx/dm1q:13/TP1A.220624.014/S911BXXS3DWI1:user/release-keys
+          ro.build.description=dm1qxxx-user 13 TP1A.220624.014 S911BXXS3DWI1 release-keys
+          ro.build.version.release=13
+          ro.build.version.sdk=33
+          ro.build.type=user
+          ro.build.tags=release-keys
+          ro.product.cpu.abi=arm64-v8a
+          ro.product.cpu.abilist=arm64-v8a,armeabi-v7a,armeabi
+          ro.product.cpu.abilist32=armeabi-v7a,armeabi
+          ro.product.cpu.abilist64=arm64-v8a
+          ro.arch=arm64
+          ro.product.cpu.cortextype=Cortex-X3+Cortex-A715+Cortex-A710+Cortex-A510
+          ro.build.version.oneui=60100
+          ro.build.PDA=S911BXXS3DWI1
+          ro.csc.country_code=US
+          ro.surface_flinger.has_HDR_display=1
+          ro.surface_flinger.primary_display_orientation=0
+          BPROP
+
+          adb push /tmp/build.prop.base /system/build.prop
+          adb shell "chmod 644 /system/build.prop"
+
+          # ── push GLES hook ────────────────────────────────────────────────
+          if [ -f /tmp/spoof/gles.so ]; then
+              adb push /tmp/spoof/gles.so /system/lib64/libgles_hook.so
+              adb shell "chmod 644 /system/lib64/libgles_hook.so"
+              for PKG in \
+                  "com.roblox.client" \
+                  "net.hive.minecraft" \
+                  "com.mojang.minecraftpe"
+              do
+                  adb shell "setprop wrap.${PKG} 'LD_PRELOAD=/system/lib64/libgles_hook.so'"
+              done
+              echo "[i] gles hook injected"
+          fi
+
+          # ── final reboot to apply build.prop ──────────────────────────────
+          adb reboot
+          echo "[i] waiting for final boot..."
+          sleep 8
+          adb wait-for-device
+          _wait_boot
+          echo "[i] S23 identity active"
+
+          # ── x11vnc ───────────────────────────────────────────────
